@@ -1,0 +1,37 @@
+# Maintainer: archlinux-muyu
+# 来源：hadess/iio-sensor-proxy 3.9 官方源码包（gitlab.freedesktop.org 归档 tarball）
+# 上游作业：meson setup output --prefix=/usr -Db_lto=true -Dssc-support=enabled
+#             -Dsystemdsystemunitdir=/usr/lib/systemd/system → compile → meson install
+# 原生化要点：只把 dpkg-deb 换成 makepkg；-Dssc-support=enabled 依赖本仓库的 libssc（含 QRTR 等待补丁）
+# 包名取舍：Arch/ALARM 官方已有 iio-sensor-proxy，同名会与官方版本比较，故加 -muyu 后缀并声明
+#   provides/conflicts=('iio-sensor-proxy')（目录沿用上游项目名，便于对照上游作业）
+# 选项与依赖：3.9 的 meson 接受 -Dsystemdsystemunitdir（已实跑验证）；dbus/glib2/libgudev/polkit
+#   为运行期保守集合，版本升级后若选项更名，构建阶段会直接报未知选项
+pkgname=iio-sensor-proxy-muyu
+pkgver=3.9
+pkgrel=1
+pkgdesc="IIO sensors to D-Bus proxy with SSC backend, for Xiaomi Pad 7 Pro (muyu)"
+arch=('aarch64')
+url="https://gitlab.freedesktop.org/hadess/iio-sensor-proxy"
+license=('GPL-3.0-or-later')
+provides=('iio-sensor-proxy')
+conflicts=('iio-sensor-proxy')
+depends=('dbus' 'glib2' 'libgudev' 'polkit' 'libssc')
+makedepends=('meson' 'ninja' 'systemd' 'libssc')
+options=('!strip' '!debug' '!lto')
+source=("iio-sensor-proxy-3.9.tar.gz::https://gitlab.freedesktop.org/hadess/iio-sensor-proxy/-/archive/3.9/iio-sensor-proxy-3.9.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/iio-sensor-proxy-3.9" || exit 1
+  meson setup output --prefix=/usr \
+        -Db_lto=true \
+        -Dssc-support=enabled \
+        -Dsystemdsystemunitdir=/usr/lib/systemd/system
+  meson compile -C output
+}
+
+package() {
+  cd "$srcdir/iio-sensor-proxy-3.9" || exit 1
+  DESTDIR="$pkgdir" meson install --no-rebuild -C output
+}

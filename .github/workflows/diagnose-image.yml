@@ -1,0 +1,169 @@
+name: Diagnose RootFS Image
+
+# 镜像体检：把某次运行产出的 rootfs.img 挂起来，逐项检查引导相关状态
+# （fstab / 内核模块 / 固件 / 已启用 unit / ext4 几何与文件大小是否自洽 …）
+# 用途：设备刷入后黑屏等问题时，先确认镜像本身是否完整、自洽。
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: '要体检的运行 ID（留空则取本仓库最近一次成功的 Build RootFS 运行）'
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: 'artifact 名称（留空则自动挑一个 rootfs-*）'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnose:
+    name: Inspect rootfs.img
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Pick run & artifact
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID="${{ inputs.source_run_id }}"
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID="$(gh run list --repo "$GITHUB_REPOSITORY" --status success --limit 20 \
+              --json databaseId,workflowName -q '[.[] | select(.workflowName=="Build RootFS (Arch Linux ARM)")][0].databaseId')"
+          fi
+          [ -n "$RUN_ID" ] || { echo "::error::找不到可用的运行"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          NAME="${{ inputs.artifact_name }}"
+          if [ -z "$NAME" ]; then
+            NAME="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" -q '.artifacts[].name' | grep -E '^rootfs-' | head -n1)"
+          fi
+          [ -n "$NAME" ] || { echo "::error::找不到 rootfs-* artifact（run $RUN_ID）"; exit 1; }
+          echo "artifact=$NAME" >> "$GITHUB_OUTPUT"
+          echo "体检 run=$RUN_ID artifact=$NAME"
+
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ steps.pick.outputs.run_id }}" --repo "$GITHUB_REPOSITORY" \
+            --name "${{ steps.pick.outputs.artifact }}" --dir img
+          find img -name '*.img' -exec ls -l {} \;
+
+      - name: ext4 geometry check
+        run: |
+          IMG="$(find img -name 'rootfs*.img' | head -n1)"
+          [ -n "$IMG" ] || { echo "::error::压缩包里没有 rootfs*.img"; exit 1; }
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          echo "文件大小: $(stat -c%s "$IMG")  ($(du -h "$IMG" | cut -f1))"
+          python3 scripts/tools/ext4-info.py "$IMG"
+
+      - name: Mount and dump
+        run: |
+          sudo mkdir -p /mnt/img
+          sudo mount -o loop,ro "$IMG" /mnt/img
+          echo "已挂载 $IMG"
+
+          echo "===== /etc/os-release ====="
+          sudo cat /mnt/img/etc/os-release 2>/dev/null || echo "(缺失)"
+          echo "===== /etc/fstab ====="
+          sudo cat /mnt/img/etc/fstab 2>/dev/null || echo "(缺失)"
+          echo "===== /etc/machine-id ====="
+          sudo cat /mnt/img/etc/machine-id 2>/dev/null || echo "(缺失)"
+
+          echo "===== /usr/lib/modules ====="
+          sudo ls -1 /mnt/img/usr/lib/modules 2>/dev/null || echo "(缺失)"
+          for d in /mnt/img/usr/lib/modules/*/; do
+            echo "  $d"
+            sudo ls "$d" 2>/dev/null | head -5 | sed 's/^/    /'
+            sudo test -f "$d/modules.dep" && echo "    [ OK ] modules.dep" || echo "    [FAIL] 缺 modules.dep"
+            sudo test -d "$d/kernel" && echo "    [ OK ] kernel/ 模块目录存在" || echo "    [FAIL] 缺 kernel/"
+          done
+          echo "内核模块（.ko*）数量: $(sudo find /mnt/img/usr/lib/modules -name '*.ko*' 2>/dev/null | wc -l)"
+
+          echo "===== 固件 ====="
+          sudo du -sh /mnt/img/lib/firmware 2>/dev/null || echo "(无 /lib/firmware)"
+          echo "-- /lib/firmware/qcom 前 20 项 --"
+          sudo ls /mnt/img/lib/firmware/qcom 2>/dev/null | head -20 || echo "(无 qcom 目录)"
+          echo "-- Adreno / a740 固件 --"
+          sudo find /mnt/img/lib/firmware \( -iname '*a740*' -o -iname '*adreno*' \) 2>/dev/null | head -10 || true
+          echo "-- sm8550 / muyu 固件 --"
+          sudo find /mnt/img/lib/firmware -path '*sm8550*' 2>/dev/null | head -10 || true
+
+          echo "===== 设备包（pacman local db）====="
+          sudo ls -1 /mnt/img/var/lib/pacman/local 2>/dev/null | sed 's/^/    /' || echo "(无 pacman 数据库)"
+
+          echo "===== 已启用的 unit ====="
+          for t in graphical.target multi-user.target NetworkManager.service plasma-autologin.service sddm.service gdm.service adsprpcd-sensorspd.service muyu-devauth.service iio-sensor-proxy.service; do
+            state="$(sudo systemctl --root=/mnt/img is-enabled "$t" 2>/dev/null || true)"
+            printf '    %-40s %s\n' "$t" "${state:-（未启用或不存在）}"
+          done
+
+          echo "===== init（内核 exec 的第一个进程）====="
+          for cand in /sbin/init /usr/sbin/init /usr/lib/systemd/systemd; do
+            if sudo test -x "/mnt/img$cand"; then
+              target="$(sudo readlink -f "/mnt/img$cand" 2>/dev/null || echo '')"
+              echo "    [ OK ] $cand${target:+ -> $target}"
+            else
+              echo "    [FAIL] 缺 $cand"
+            fi
+          done
+          # 缺 /sbin/init 时内核 panic: No working init found → 实机全黑、背光不亮
+          if sudo ls /mnt/img/var/lib/pacman/local 2>/dev/null | grep -q '^systemd-sysvcompat-'; then
+            echo "    [ OK ] systemd-sysvcompat 已安装"
+          else
+            echo "    [FAIL] 未安装 systemd-sysvcompat（/sbin/init 的来源）"
+          fi
+
+          echo "===== 图形会话关键件 ====="
+          for bin in /usr/bin/kwin_wayland /usr/bin/startplasma-wayland /usr/bin/plasmashell /usr/bin/sddm; do
+            if sudo test -x "/mnt/img$bin"; then
+              miss="$(sudo chroot /mnt/img ldd "$bin" 2>/dev/null | grep 'not found' || true)"
+              if [ -n "$miss" ]; then
+                echo "    [FAIL] $bin 缺库:"; echo "$miss" | sed 's/^/        /'
+              else
+                echo "    [ OK ] $bin（动态库齐全）"
+              fi
+            else
+              echo "    [ -- ] $bin 不存在"
+            fi
+          done
+          echo "---- 会话入口 ----"
+          sudo ls /mnt/img/usr/share/wayland-sessions 2>/dev/null | sed 's/^/    wayland: /' || echo "    (无 wayland-sessions)"
+          echo "---- 关键包 ----"
+          for p in plasma-workspace kwin mesa qt6-wayland qt6-declarative xdg-desktop-portal-kde polkit-kde-agent sddm; do
+            if sudo ls /mnt/img/var/lib/pacman/local 2>/dev/null | grep -q "^$p-"; then echo "    [ OK ] $p"; else echo "    [FAIL] $p 未安装"; fi
+          done
+
+          echo "===== default.target ====="
+          sudo readlink -f /mnt/img/etc/systemd/system/default.target 2>/dev/null || echo "(无 default.target 链接)"
+
+          echo "===== /boot 内容 ====="
+          sudo ls -lh /mnt/img/boot 2>/dev/null | sed 's/^/    /' || echo "(无 /boot)"
+
+          echo "===== udev rules ====="
+          sudo ls /mnt/img/etc/udev/rules.d 2>/dev/null | sed 's/^/    /' || true
+
+          echo "===== 内核 cmdline 期望（从 artifact 名推断 boot_mode）====="
+          sudo umount /mnt/img
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 镜像体检：${{ steps.pick.outputs.artifact }}"
+            echo ""
+            echo "- 来源运行: ${{ steps.pick.outputs.run_id }}"
+            if [ -n "${IMG:-}" ]; then
+              echo "- 镜像文件: \`$IMG\`（$(stat -c%s "$IMG" 2>/dev/null || echo '?') 字节）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
